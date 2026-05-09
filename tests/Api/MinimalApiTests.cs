@@ -27,7 +27,11 @@ public class MinimalApiTests : IDisposable
             direction = "debit"
         };
 
-        var response = await client.PostAsJsonAsync("/accounts", request);
+        var httpRequest = new HttpRequestMessage(HttpMethod.Post, "/accounts");
+        httpRequest.Content = JsonContent.Create(request);
+        httpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+
+        var response = await client.SendAsync(httpRequest);
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadFromJsonAsync<AccountResponse>();
@@ -42,7 +46,10 @@ public class MinimalApiTests : IDisposable
     {
         var client = _factory.CreateClient();
         var accountRequest = new { name = "Cash", direction = "debit" };
-        var accountResponse = await client.PostAsJsonAsync("/accounts", accountRequest);
+        var accountHttpRequest = new HttpRequestMessage(HttpMethod.Post, "/accounts");
+        accountHttpRequest.Content = JsonContent.Create(accountRequest);
+        accountHttpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var accountResponse = await client.SendAsync(accountHttpRequest);
         var account = await accountResponse.Content.ReadFromJsonAsync<AccountResponse>();
 
         var transactionRequest = new
@@ -54,7 +61,10 @@ public class MinimalApiTests : IDisposable
             }
         };
 
-        var response = await client.PostAsJsonAsync("/transactions", transactionRequest);
+        var transactionHttpRequest = new HttpRequestMessage(HttpMethod.Post, "/transactions");
+        transactionHttpRequest.Content = JsonContent.Create(transactionRequest);
+        transactionHttpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var response = await client.SendAsync(transactionHttpRequest);
 
         Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
     }
@@ -63,8 +73,16 @@ public class MinimalApiTests : IDisposable
     public async Task CreateTransaction_with_unbalanced_entries_returns_bad_request()
     {
         var client = _factory.CreateClient();
-        var account1 = await client.PostAsJsonAsync("/accounts", new { name = "A", direction = "debit" });
-        var account2 = await client.PostAsJsonAsync("/accounts", new { name = "B", direction = "credit" });
+        var account1HttpRequest = new HttpRequestMessage(HttpMethod.Post, "/accounts");
+        account1HttpRequest.Content = JsonContent.Create(new { name = "A", direction = "debit" });
+        account1HttpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var account1 = await client.SendAsync(account1HttpRequest);
+
+        var account2HttpRequest = new HttpRequestMessage(HttpMethod.Post, "/accounts");
+        account2HttpRequest.Content = JsonContent.Create(new { name = "B", direction = "credit" });
+        account2HttpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var account2 = await client.SendAsync(account2HttpRequest);
+
         var account1Body = await account1.Content.ReadFromJsonAsync<AccountResponse>();
         var account2Body = await account2.Content.ReadFromJsonAsync<AccountResponse>();
 
@@ -78,7 +96,10 @@ public class MinimalApiTests : IDisposable
             }
         };
 
-        var response = await client.PostAsJsonAsync("/transactions", transactionRequest);
+        var transactionHttpRequest = new HttpRequestMessage(HttpMethod.Post, "/transactions");
+        transactionHttpRequest.Content = JsonContent.Create(transactionRequest);
+        transactionHttpRequest.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+        var response = await client.SendAsync(transactionHttpRequest);
 
         Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
     }

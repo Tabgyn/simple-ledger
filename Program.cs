@@ -1,5 +1,7 @@
 using System.Text.Json.Serialization;
 using SimpleLedger.Application;
+using SimpleLedger.Application.Projectors;
+using SimpleLedger.Application.ReadModels;
 using SimpleLedger.Domain;
 using SimpleLedger.Domain.ValueObjects;
 using SimpleLedger.Infrastructure;
@@ -12,6 +14,11 @@ builder.Services.AddOpenApi();
 
 builder.Services.AddSingleton<IAccountRepository, InMemoryAccountRepository>();
 builder.Services.AddSingleton<ITransactionRepository, InMemoryTransactionRepository>();
+builder.Services.AddSingleton<IEventStore, InMemoryEventStore>();
+builder.Services.AddSingleton<AccountCommandService>();
+builder.Services.AddSingleton<IdempotencyService>();
+builder.Services.AddSingleton<AccountProjector>();
+builder.Services.AddSingleton<TransactionProjector>();
 builder.Services.AddSingleton<LedgerService>();
 
 var app = builder.Build();
@@ -23,8 +30,12 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.MapPost("/accounts", async (CreateAccountRequest request, IAccountRepository repository) =>
+app.MapPost("/accounts", async (CreateAccountRequest request, LedgerService ledgerService, AccountProjector projector, HttpContext context) =>
 {
+    var idempotencyKey = context.Request.Headers["Idempotency-Key"].ToString();
+    if (string.IsNullOrEmpty(idempotencyKey))
+        return Results.BadRequest(new { error = "Idempotency-Key header is required" });
+
     if (!TryValidateCreateAccountRequest(request, out var problem))
         return problem!;
 
@@ -32,30 +43,47 @@ app.MapPost("/accounts", async (CreateAccountRequest request, IAccountRepository
     var name = new Name(string.IsNullOrWhiteSpace(request.Name) ? "Unnamed" : request.Name.Trim());
     var direction = request.Direction.Trim().ToLowerInvariant();
 
-    var account = direction switch
+    try
     {
-        "debit" => new DebitAccount(new AccountId(accountId), name) as Account,
-        "credit" => new CreditAccount(new AccountId(accountId), name),
-        _ => throw new InvalidOperationException("Unreachable direction validation")
-    };
+        var account = await ledgerService.CreateAccountAsync(idempotencyKey, new AccountId(accountId), name, direction);
 
-    await repository.Save(account);
+        // Project the events to update read models
+        var events = await app.Services.GetRequiredService<IEventStore>().GetEventsAsync(accountId);
+        projector.Project(events);
 
-    return Results.Ok(new AccountResponse(account.Id.Value, account.Name.Value, direction, account.Balance.Amount));
+        var readModel = projector.GetAccount(accountId);
+        if (readModel == null) return Results.Problem("Failed to create account read model");
+
+        return Results.Ok(new AccountResponse(readModel.Id, readModel.Name, readModel.Direction, readModel.Balance));
+    }
+    catch (IdempotencyException)
+    {
+        // For idempotency, return the existing account
+        var readModel = projector.GetAccount(accountId);
+        if (readModel == null) return Results.NotFound();
+        return Results.Ok(new AccountResponse(readModel.Id, readModel.Name, readModel.Direction, readModel.Balance));
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Conflict(new { error = ex.Message });
+    }
 });
 
-app.MapGet("/accounts/{id:guid}", async (Guid id, IAccountRepository repository) =>
+app.MapGet("/accounts/{id:guid}", async (Guid id, AccountProjector projector) =>
 {
-    var account = await repository.Get(new AccountId(id));
+    var account = projector.GetAccount(id);
     if (account is null)
         return Results.NotFound();
 
-    var direction = account is DebitAccount ? "debit" : "credit";
-    return Results.Ok(new AccountResponse(account.Id.Value, account.Name.Value, direction, account.Balance.Amount));
+    return Results.Ok(new AccountResponse(account.Id, account.Name, account.Direction, account.Balance));
 });
 
-app.MapPost("/transactions", async (CreateTransactionRequest request, IAccountRepository accountRepository, ITransactionRepository transactionRepository, LedgerService ledgerService) =>
+app.MapPost("/transactions", async (CreateTransactionRequest request, LedgerService ledgerService, AccountProjector accountProjector, TransactionProjector transactionProjector, IEventStore eventStore, HttpContext context) =>
 {
+    var idempotencyKey = context.Request.Headers["Idempotency-Key"].ToString();
+    if (string.IsNullOrEmpty(idempotencyKey))
+        return Results.BadRequest(new { error = "Idempotency-Key header is required" });
+
     if (!TryValidateCreateTransactionRequest(request, out var problem))
         return problem!;
 
@@ -78,20 +106,41 @@ app.MapPost("/transactions", async (CreateTransactionRequest request, IAccountRe
     try
     {
         transaction = new Transaction(request.Id.HasValue ? new TransactionId(request.Id.Value) : new TransactionId(Guid.NewGuid()), new Name(string.IsNullOrWhiteSpace(request.Name) ? "Unnamed" : request.Name.Trim()), entries);
-        await ledgerService.ApplyTransaction(transaction);
-    }
-    catch (InvalidOperationException ex) when (ex.Message.Contains("Account not found", StringComparison.OrdinalIgnoreCase))
-    {
-        return Results.NotFound(new { error = ex.Message });
     }
     catch (InvalidOperationException ex) when (ex.Message.Contains("Transaction must balance", StringComparison.OrdinalIgnoreCase))
     {
         return Results.BadRequest(new { error = ex.Message });
     }
 
-    await transactionRepository.Save(transaction);
+    try
+    {
+        await ledgerService.ApplyTransactionAsync(idempotencyKey, transaction);
 
-    return Results.Ok(new TransactionResponse(transaction.Id.Value, transaction.Name.Value, transaction.Entries.Select(e => new EntryResponse(e.Id.Value, e is DebitEntry ? "debit" : "credit", e.Amount.Amount, e.AccountId.Value)).ToList()));
+        // Project events to update read models
+        var affectedAccountIds = transaction.Entries.Select(e => e.AccountId.Value).Distinct();
+        foreach (var accountId in affectedAccountIds)
+        {
+            var events = await eventStore.GetEventsAsync(accountId);
+            accountProjector.Project(events);
+        }
+
+        // Project transaction events (assuming transaction events are on accounts)
+        var transactionEvents = await eventStore.GetEventsAsync(affectedAccountIds.First());
+        transactionProjector.Project(transactionEvents.Where(e => e is SimpleLedger.Domain.Events.TransactionApplied));
+
+        var transactionReadModel = transactionProjector.GetTransaction(transaction.Id.Value);
+        if (transactionReadModel == null) return Results.Problem("Failed to create transaction read model");
+
+        return Results.Ok(new TransactionResponse(transactionReadModel.Id, transactionReadModel.Name, transactionReadModel.Entries.Select(e => new EntryResponse(e.Id, e.Direction, e.Amount, e.AccountId)).ToList()));
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("Account not found", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.NotFound(new { error = ex.Message });
+    }
+    catch (InvalidOperationException ex) when (ex.Message.Contains("Concurrent modification", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Conflict(new { error = ex.Message });
+    }
 });
 
 static bool TryValidateCreateAccountRequest(CreateAccountRequest request, out IResult? problem)
