@@ -1,0 +1,6 @@
+@simple_ledger_HostAddress = http://localhost:5103
+
+GET {{simple_ledger_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
